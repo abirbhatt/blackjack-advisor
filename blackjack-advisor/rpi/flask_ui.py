@@ -121,11 +121,12 @@ def create_app(game_state):
 
     @app.route("/reset")
     def reset():
-        """Reset game state for a new shoe (called via UI button)."""
+        """Reset game state for a new hand (called via UI button)."""
         game_state.update({
             "detected_cards": [], "running_count": 0, "true_count": 0.0,
             "deck_state": {}, "recommendation": None, "ev_breakdown": {},
             "bet_recommendation": 10, "player_hand": [], "dealer_upcard": None,
+            "reset_requested": True,   # Tells the processing loop to reset deck/counter too
         })
         return jsonify({"status": "reset"})
 

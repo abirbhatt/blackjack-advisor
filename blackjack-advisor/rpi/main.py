@@ -49,6 +49,7 @@ game_state = {
     "bet_recommendation": BASE_BET,
     "player_hand":       [],
     "dealer_upcard":     None,
+    "reset_requested":   False,   # Set True by /reset route to signal the loop
 }
 
 # ── Graceful Shutdown ─────────────────────────────────────────────────────────
@@ -69,13 +70,23 @@ def processing_loop():
     global camera
     camera       = init_camera()
     model        = load_model("model.tflite")
-    deck_mgr     = DeckManager()
-    counter      = HiLoCounter()
-    ev_calc      = EVCalculator()
+    deck_mgr       = DeckManager()
+    counter        = HiLoCounter()
+    ev_calc        = EVCalculator()
     previous_cards = set()
+    deal_count     = 0   # Tracks position in the deal: 0=player, 1=player, 2=dealer, 3+=hit
 
     while True:
       try:
+        # Handle reset requested from the Flask /reset button
+        if game_state["reset_requested"]:
+            deck_mgr.reset()
+            counter.reset()
+            previous_cards = set()
+            deal_count     = 0
+            game_state["reset_requested"] = False
+            print("\n[main] Game reset.")
+
         frame = capture_frame(camera)
 
         # Step 1: Detect card bounding boxes with OpenCV
@@ -108,16 +119,19 @@ def processing_loop():
         for rank, suit in new_cards:
             logger.log_card(rank, suit, running, true)
 
-        # Assign new cards to dealer/player hands for EV calculation.
-        # Simple rule: first card placed on table = dealer upcard,
-        # all subsequent cards = player hand (up to 5 cards).
+        # Assign new cards to dealer/player hands based on blackjack deal order:
+        #   deal_count 0 → player card 1
+        #   deal_count 1 → player card 2  (face-down dealer card is skipped — low confidence)
+        #   deal_count 2 → dealer upcard
+        #   deal_count 3+ → player hit cards
         for rank, suit in new_cards:
-            if game_state["dealer_upcard"] is None:
+            if deal_count == 2:
                 game_state["dealer_upcard"] = rank
-                print(f"\n[main] Dealer upcard set: {rank}")
-            elif len(game_state["player_hand"]) < 5:
+                print(f"\n[main] Dealer upcard: {rank}")
+            else:
                 game_state["player_hand"].append(rank)
                 print(f"\n[main] Player hand: {game_state['player_hand']}")
+            deal_count += 1
 
         # Step 5: Update game state
         best_action, ev_breakdown = ev_calc.recommend(
