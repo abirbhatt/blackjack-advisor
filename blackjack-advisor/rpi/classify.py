@@ -6,32 +6,27 @@
 # TFLite is a compressed, optimized format for inference on embedded devices
 # like the RPi — much faster than running a full TensorFlow model.
 #
-# The model is a 52-class classifier (13 ranks × 4 suits).
+# The model is a 13-class classifier (one class per rank: A 2-9 10 J Q K).
+# Suit is not classified — only rank matters for Hi-Lo card counting.
 # If confidence is below CV_CONFIDENCE (0.85), the result is flagged as
 # uncertain rather than committing a potential misclassification.
 #
 # Note: AI tools (Claude) were used to assist with code development.
 
 import numpy as np
-import tensorflow as tf
-tflite = tf.lite
 
-# Ordered list of class labels — must match the order used during training
-CARD_LABELS = [
-    "2_clubs", "2_diamonds", "2_hearts", "2_spades",
-    "3_clubs", "3_diamonds", "3_hearts", "3_spades",
-    "4_clubs", "4_diamonds", "4_hearts", "4_spades",
-    "5_clubs", "5_diamonds", "5_hearts", "5_spades",
-    "6_clubs", "6_diamonds", "6_hearts", "6_spades",
-    "7_clubs", "7_diamonds", "7_hearts", "7_spades",
-    "8_clubs", "8_diamonds", "8_hearts", "8_spades",
-    "9_clubs", "9_diamonds", "9_hearts", "9_spades",
-    "10_clubs", "10_diamonds", "10_hearts", "10_spades",
-    "J_clubs", "J_diamonds", "J_hearts", "J_spades",
-    "Q_clubs", "Q_diamonds", "Q_hearts", "Q_spades",
-    "K_clubs", "K_diamonds", "K_hearts", "K_spades",
-    "A_clubs", "A_diamonds", "A_hearts", "A_spades",
-]
+# tflite-runtime is a lightweight inference-only package — no training deps,
+# no flatbuffers/imp issues. Falls back to full tensorflow if not installed.
+try:
+    import tflite_runtime.interpreter as tflite
+except ImportError:
+    import tensorflow as tf
+    tflite = tf.lite
+
+# Ordered list of class labels — must match the alphabetical folder sort order
+# that Keras ImageDataGenerator.flow_from_directory assigns.
+# Python sorts folder names as strings, so "10" < "2" < "3" ... < "9" < "A" < "J" < "K" < "Q"
+CARD_LABELS = ["10", "2", "3", "4", "5", "6", "7", "8", "9", "A", "J", "K", "Q"]
 
 
 def load_model(model_path):
@@ -73,12 +68,11 @@ def classify_card(interpreter, corner_img):
     interpreter.set_tensor(input_details[0]['index'], img)
     interpreter.invoke()
 
-    output = interpreter.get_tensor(output_details[0]['index'])[0]  # Shape: (52,)
+    output = interpreter.get_tensor(output_details[0]['index'])[0]  # Shape: (13,)
 
     # Softmax output — highest value is the predicted class
-    predicted_idx  = int(np.argmax(output))
-    confidence     = float(output[predicted_idx])
-    label          = CARD_LABELS[predicted_idx]   # e.g. "A_spades"
-    rank, suit     = label.split("_", 1)
+    predicted_idx = int(np.argmax(output))
+    confidence    = float(output[predicted_idx])
+    rank          = CARD_LABELS[predicted_idx]    # e.g. "A", "10", "K"
 
-    return rank, suit, confidence
+    return rank, "", confidence  # Suit not classified — only rank needed for counting
