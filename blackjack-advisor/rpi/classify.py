@@ -15,13 +15,20 @@
 
 import numpy as np
 
-# tflite-runtime is a lightweight inference-only package — no training deps,
-# no flatbuffers/imp issues. Falls back to full tensorflow if not installed.
+# Inference backend priority:
+#   1. ai-edge-litert  — Google's replacement for tflite-runtime on Python 3.12+
+#   2. tflite-runtime  — legacy lightweight package (Python ≤3.11)
+#   3. tensorflow      — full package fallback
 try:
-    import tflite_runtime.interpreter as tflite
+    from ai_edge_litert.interpreter import Interpreter as _Interpreter
+    class tflite:
+        Interpreter = _Interpreter
 except ImportError:
-    import tensorflow as tf
-    tflite = tf.lite
+    try:
+        import tflite_runtime.interpreter as tflite
+    except ImportError:
+        import tensorflow as tf
+        tflite = tf.lite
 
 # Ordered list of class labels — must match the alphabetical folder sort order
 # that Keras ImageDataGenerator.flow_from_directory assigns.
