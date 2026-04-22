@@ -13,7 +13,8 @@
 # Note: AI tools (Claude) were used to assist with code development.
 
 import numpy as np
-import tflite_runtime.interpreter as tflite
+import tensorflow as tf
+tflite = tf.lite
 
 # Ordered list of class labels — must match the order used during training
 CARD_LABELS = [
