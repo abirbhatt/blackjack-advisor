@@ -32,13 +32,12 @@ from flask_ui import create_app
 PLAYER_PHONE   = "+16502085215"   # TODO: replace with your phone number e.g. "+12135551234"
 BASE_BET       = 10               # Minimum bet in dollars
 BANKROLL       = 500              # Starting bankroll in dollars
-CV_CONFIDENCE  = 0.70             # Minimum CNN confidence to count a classification vote
 CAPTURE_FPS    = 5                # Frames to process per second
 STEP_STABLE    = 6                # Frames a new box count must hold before committing the card
 
-# Deal sequence: index 0-3 maps to the role of each card placed
-# 0 = player card 1, 1 = dealer hole (face-down, skipped), 2 = player card 2, 3 = dealer upcard
-DEAL_ROLES = ["player", "hole", "player", "dealer"]
+# Deal sequence (3 visible cards — hole card is dealt off-camera):
+# 0 = player card 1, 1 = player card 2, 2 = dealer upcard
+DEAL_ROLES = ["player", "player", "dealer"]
 
 # ── Module-level camera reference so shutdown() can access it ────────────────
 camera = None
@@ -94,7 +93,7 @@ def processing_loop():
     #
     # Boxes are sorted left→right (x-coord) each frame so the ordering is
     # consistent regardless of which box OpenCV returns first.
-    deal_step   = 0    # which card we're waiting for next (0-3)
+    deal_step   = 0    # which card we're waiting for next (0–len(DEAL_ROLES)-1)
     step_stable = 0    # consecutive frames we've seen (deal_step+1) boxes
     step_votes  = []   # classification votes accumulated during stable period
     sms_sent    = False
@@ -130,49 +129,37 @@ def processing_loop():
         new_dealer_card = None
 
         # ── Deal-sequence state machine ───────────────────────────────────────
-        if deal_step < 4:
+        if deal_step < len(DEAL_ROLES):
             expected = deal_step + 1   # how many boxes we need to see
 
             if n == expected:
-                # Box count matches — accumulate
+                # Box count matches — accumulate a classification vote for this slot
                 step_stable += 1
-
-                role = DEAL_ROLES[deal_step]
-
-                if role != "hole":
-                    # Classify the card at this slot
-                    box = bounding_boxes[deal_step]
-                    x, y, w, h = box
-                    img = cv2.resize(frame[y:y + h, x:x + w], (64, 64))
-                    rank, _, conf = classify_card(model, img)
-                    if conf >= CV_CONFIDENCE:
-                        step_votes.append(rank)
+                box = bounding_boxes[deal_step]
+                x, y, w, h = box
+                img = cv2.resize(frame[y:y + h, x:x + w], (64, 64))
+                rank, _, conf = classify_card(model, img)
+                step_votes.append(rank)   # always vote — majority wins
 
                 if step_stable >= STEP_STABLE:
-                    # Commit this card
-                    if role == "hole":
-                        print(f"\n[main] Card {deal_step + 1}: dealer hole (face-down, skipped)")
-                    elif step_votes:
-                        committed = Counter(step_votes).most_common(1)[0][0]
-                        if role == "player":
-                            new_player_card = committed
-                        else:
-                            new_dealer_card = committed
-                        print(f"\n[main] Card {deal_step + 1} ({role}): {committed}  "
-                              f"(votes={step_votes})")
+                    # Commit using majority vote
+                    committed = Counter(step_votes).most_common(1)[0][0]
+                    role = DEAL_ROLES[deal_step]
+                    if role == "player":
+                        new_player_card = committed
                     else:
-                        print(f"\n[main] Card {deal_step + 1} ({role}): "
-                              f"no confident vote — confidence too low, skipping slot")
-
+                        new_dealer_card = committed
+                    print(f"\n[main] Card {deal_step + 1} ({role}): {committed}  "
+                          f"(votes={step_votes})")
                     deal_step  += 1
                     step_stable = 0
                     step_votes  = []
 
             elif n < expected:
-                # A box disappeared (card removed mid-deal, or detection glitch) → reset streak
+                # Box disappeared — reset streak
                 step_stable = 0
                 step_votes  = []
-            # n > expected: extra box visible during card placement — just wait
+            # n > expected: card being placed, wait for count to stabilise
 
         # Step 2: Process new cards
         new_cards = []
