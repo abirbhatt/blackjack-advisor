@@ -29,12 +29,14 @@ from flask_ui import create_app
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-PLAYER_PHONE  = "+16502085215"   # TODO: replace with your phone number e.g. "+12135551234"
-BASE_BET      = 10               # Minimum bet in dollars
-BANKROLL      = 500              # Starting bankroll in dollars
-CV_CONFIDENCE  = 0.85             # Minimum CNN confidence to commit a classification
-CAPTURE_FPS    = 2                # Frames to process per second
+PLAYER_PHONE   = "+16502085215"   # TODO: replace with your phone number e.g. "+12135551234"
+BASE_BET       = 10               # Minimum bet in dollars
+BANKROLL       = 500              # Starting bankroll in dollars
+CV_CONFIDENCE  = 0.85             # Minimum CNN confidence to accept a classification
+CAPTURE_FPS    = 5                # Frames to process per second (higher = more responsive streaks)
 PILE_PROXIMITY = 200              # Pixels — how close a box must be to a known pile to belong to it
+STABLE_FRAMES  = 5                # Consecutive confident frames required to commit a card
+COOLDOWN_SECS  = 2.0              # Seconds a pile is locked after committing a card
 
 # ── Module-level camera reference so shutdown() can access it ────────────────
 camera = None
@@ -88,27 +90,27 @@ def processing_loop():
     counter  = HiLoCounter()
     ev_calc  = EVCalculator()
 
-    # Self-calibrating two-pile tracker.
+    # Self-calibrating two-pile tracker with streak-based commit.
     #
-    # The first bounding box ever seen becomes the PLAYER pile anchor.
-    # Any box appearing far from the player pile becomes the DEALER pile anchor.
-    # No left/right or top/bottom assumption — the system learns from wherever
-    # the user physically places the first card.
+    # A card is committed only after STABLE_FRAMES consecutive confident
+    # classifications of the same rank at the same pile.  After a commit the
+    # pile is locked for COOLDOWN_SECS so normal fluctuation can never spam
+    # the same card multiple times.
     #
-    # prev_*_rank tracks the last confident classification at each pile.
-    # When the classification changes → new card was placed on top.
-    # When confidence drops → hand is placing a card (transition) → reset to None
-    #   so the next confident result registers as a new card.
-    #   This also handles same-rank cards (8 on 8), since covering and re-placing
-    #   creates a low-confidence frame that resets the tracker.
-    #
-    # Face-down dealer hole card: low confidence → dealer_prev_rank stays None
-    #   → face-up upcard later placed on top triggers as first confident dealer card.
-    player_pile_box  = None   # Anchor box for player pile (set on first detection)
-    dealer_pile_box  = None   # Anchor box for dealer pile (set when second location seen)
-    player_prev_rank = None   # Last confirmed rank at player pile
-    dealer_prev_rank = None   # Last confirmed rank at dealer pile
-    sms_sent         = False  # One SMS per completed hand
+    # Face-down hole card: always low confidence → streak never builds → ignored.
+    # Same-rank card on top: cooldown expires, streak resets, then builds again.
+    player_pile_box    = None   # Anchor for player pile
+    dealer_pile_box    = None   # Anchor for dealer pile
+
+    player_candidate   = None   # Rank accumulating streak at player pile
+    player_streak      = 0      # Consecutive frames for that candidate
+    player_cooldown_ts = 0.0    # time.time() after which player pile can fire again
+
+    dealer_candidate   = None
+    dealer_streak      = 0
+    dealer_cooldown_ts = 0.0
+
+    sms_sent = False
 
     while True:
       try:
@@ -116,19 +118,26 @@ def processing_loop():
         if game_state["reset_requested"]:
             deck_mgr.reset()
             counter.reset()
-            player_pile_box  = None
-            dealer_pile_box  = None
-            player_prev_rank = None
-            dealer_prev_rank = None
-            sms_sent         = False
+            player_pile_box    = None
+            dealer_pile_box    = None
+            player_candidate   = None
+            player_streak      = 0
+            player_cooldown_ts = 0.0
+            dealer_candidate   = None
+            dealer_streak      = 0
+            dealer_cooldown_ts = 0.0
+            sms_sent           = False
             game_state["reset_requested"] = False
             print("\n[main] Hand reset.")
 
         frame = capture_frame(camera)
+        now   = time.time()
 
         # Step 1: Detect bounding boxes
         bounding_boxes = detect_cards(frame, camera.baseline_frame)
         print(f"[main] {len(bounding_boxes)} box(es) | "
+              f"P:{player_candidate}x{player_streak}/{STABLE_FRAMES}  "
+              f"D:{dealer_candidate}x{dealer_streak}/{STABLE_FRAMES} | "
               f"hand={game_state['player_hand']} dealer={game_state['dealer_upcard']}",
               end='\r')
 
@@ -142,39 +151,57 @@ def processing_loop():
 
             # ── Assign box to a pile ──────────────────────────────────────────
             if player_pile_box is None:
-                # First box ever → establishes player pile location
                 player_pile_box = box
                 print(f"\n[main] Player pile anchored at {box_center(box)}")
-                if conf >= CV_CONFIDENCE:
-                    new_player_card  = rank
-                    player_prev_rank = rank
-
+                is_player = True
             elif near_pile(box, player_pile_box):
-                # This box is at the player pile
-                player_pile_box = box   # Update anchor to latest position
-                if conf >= CV_CONFIDENCE:
-                    if rank != player_prev_rank:
-                        new_player_card  = rank
-                    player_prev_rank = rank
-                else:
-                    # Low confidence = hand placing card; reset so next confident fires
-                    player_prev_rank = None
-
+                player_pile_box = box
+                is_player = True
             else:
-                # Box is in a different area → dealer pile
                 if dealer_pile_box is None:
                     dealer_pile_box = box
                     print(f"\n[main] Dealer pile anchored at {box_center(box)}")
-
                 if near_pile(box, dealer_pile_box):
-                    dealer_pile_box = box   # Update anchor
-                    if conf >= CV_CONFIDENCE:
-                        if rank != dealer_prev_rank:
-                            new_dealer_card  = rank
-                        dealer_prev_rank = rank
+                    dealer_pile_box = box
+                    is_player = False
+                else:
+                    continue  # Third location — ignore
+
+            # ── Streak-based commit ───────────────────────────────────────────
+            if is_player:
+                if now < player_cooldown_ts:
+                    continue  # Pile locked after last commit
+                if conf >= CV_CONFIDENCE:
+                    if rank == player_candidate:
+                        player_streak += 1
+                        if player_streak >= STABLE_FRAMES:
+                            new_player_card    = rank
+                            player_cooldown_ts = now + COOLDOWN_SECS
+                            player_candidate   = None
+                            player_streak      = 0
                     else:
-                        # Face-down card or transition → keep dealer_prev_rank=None
-                        dealer_prev_rank = None
+                        player_candidate = rank
+                        player_streak    = 1
+                else:
+                    player_candidate = None
+                    player_streak    = 0
+            else:
+                if now < dealer_cooldown_ts:
+                    continue  # Pile locked after last commit
+                if conf >= CV_CONFIDENCE:
+                    if rank == dealer_candidate:
+                        dealer_streak += 1
+                        if dealer_streak >= STABLE_FRAMES:
+                            new_dealer_card    = rank
+                            dealer_cooldown_ts = now + COOLDOWN_SECS
+                            dealer_candidate   = None
+                            dealer_streak      = 0
+                    else:
+                        dealer_candidate = rank
+                        dealer_streak    = 1
+                else:
+                    dealer_candidate = None
+                    dealer_streak    = 0
 
         # Step 2: Process new cards
         new_cards = []
