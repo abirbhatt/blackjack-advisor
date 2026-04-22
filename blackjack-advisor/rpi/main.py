@@ -14,7 +14,7 @@ import signal
 import sys
 
 from capture import init_camera, capture_frame, close_camera
-from detect import detect_cards
+from detect import detect_cards, crop_corner
 from classify import load_model, classify_card
 from deck_manager import DeckManager
 from counter import HiLoCounter
@@ -27,11 +27,14 @@ from flask_ui import create_app
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-PLAYER_PHONE  = "+1XXXXXXXXXX"   # Player's phone number for SMS
+PLAYER_PHONE  = "+16502085215"   # TODO: replace with your phone number e.g. "+12135551234"
 BASE_BET      = 10               # Minimum bet in dollars
 BANKROLL      = 500              # Starting bankroll in dollars
 CV_CONFIDENCE = 0.85             # Minimum CNN confidence to commit a classification
 CAPTURE_FPS   = 2                # Frames to process per second
+
+# ── Module-level camera reference so shutdown() can access it ────────────────
+camera = None
 
 # ── Globals (shared between threads) ─────────────────────────────────────────
 
@@ -51,7 +54,8 @@ game_state = {
 
 def shutdown(sig, frame):
     print("\n[main] Shutting down gracefully...")
-    close_camera()
+    if camera is not None:
+        close_camera(camera)
     mqtt.disconnect()
     logger.close()
     sys.exit(0)
@@ -61,6 +65,7 @@ signal.signal(signal.SIGINT, shutdown)
 # ── Main Processing Loop ──────────────────────────────────────────────────────
 
 def processing_loop():
+    global camera
     camera       = init_camera()
     model        = load_model("model.tflite")
     deck_mgr     = DeckManager()
@@ -72,12 +77,15 @@ def processing_loop():
         frame = capture_frame(camera)
 
         # Step 1: Detect card bounding boxes with OpenCV
-        bounding_boxes = detect_cards(frame)
+        # Pass the baseline (empty table) frame for background subtraction
+        bounding_boxes = detect_cards(frame, camera.baseline_frame)
 
         # Step 2: Classify each detected card with the CNN
+        # crop_corner extracts the rank/suit corner before passing to classifier
         current_cards = set()
         for box in bounding_boxes:
-            rank, suit, confidence = classify_card(model, frame, box)
+            corner = crop_corner(frame, box)
+            rank, suit, confidence = classify_card(model, corner)
             if confidence >= CV_CONFIDENCE:
                 current_cards.add((rank, suit))
 
@@ -86,12 +94,17 @@ def processing_loop():
         for rank, suit in new_cards:
             deck_mgr.remove_card(rank)
             counter.update(rank)
-            logger.log_card(rank, suit, counter.running_count, counter.true_count)
 
         previous_cards = current_cards
 
-        # Step 4: Update game state
+        # Step 4: Compute counts AFTER updating for new cards
         running, true = counter.get_counts(deck_mgr.decks_remaining())
+
+        # Log new cards now that we have updated counts
+        for rank, suit in new_cards:
+            logger.log_card(rank, suit, running, true)
+
+        # Step 5: Update game state
         best_action, ev_breakdown = ev_calc.recommend(
             game_state["player_hand"],
             game_state["dealer_upcard"],
@@ -109,7 +122,7 @@ def processing_loop():
             "bet_recommendation": bet_rec,
         })
 
-        # Step 5: Publish to MQTT (Node 2 — HiveMQ Cloud)
+        # Step 6: Publish to MQTT (Node 2 — HiveMQ Cloud)
         if new_cards:
             for rank, suit in new_cards:
                 mqtt.publish_card(rank, suit)
@@ -118,11 +131,11 @@ def processing_loop():
         if best_action:
             mqtt.publish_recommendation(best_action, ev_breakdown)
 
-        # Step 6: Log to InfluxDB Cloud
+        # Step 7: Log to InfluxDB Cloud
         if new_cards:
             logger.log_to_influx(running, true, bet_rec, best_action)
 
-        # Step 7: Send SMS if it's the player's decision point
+        # Step 8: Send SMS if it's the player's decision point
         # TODO: Trigger SMS when player_hand is set and it's their turn
 
         time.sleep(1 / CAPTURE_FPS)
