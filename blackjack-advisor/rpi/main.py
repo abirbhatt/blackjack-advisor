@@ -12,6 +12,7 @@ import threading
 import time
 import signal
 import sys
+import math
 import cv2
 
 from capture import init_camera, capture_frame, close_camera
@@ -31,8 +32,9 @@ from flask_ui import create_app
 PLAYER_PHONE  = "+16502085215"   # TODO: replace with your phone number e.g. "+12135551234"
 BASE_BET      = 10               # Minimum bet in dollars
 BANKROLL      = 500              # Starting bankroll in dollars
-CV_CONFIDENCE = 0.85             # Minimum CNN confidence to commit a classification
-CAPTURE_FPS   = 2                # Frames to process per second
+CV_CONFIDENCE  = 0.85             # Minimum CNN confidence to commit a classification
+CAPTURE_FPS    = 2                # Frames to process per second
+PILE_PROXIMITY = 200              # Pixels — how close a box must be to a known pile to belong to it
 
 # ── Module-level camera reference so shutdown() can access it ────────────────
 camera = None
@@ -66,6 +68,18 @@ signal.signal(signal.SIGINT, shutdown)
 
 # ── Main Processing Loop ──────────────────────────────────────────────────────
 
+def box_center(box):
+    x, y, w, h = box
+    return x + w // 2, y + h // 2
+
+
+def near_pile(box, pile_box):
+    """True if box's center is within PILE_PROXIMITY pixels of pile_box's center."""
+    cx1, cy1 = box_center(box)
+    cx2, cy2 = box_center(pile_box)
+    return math.hypot(cx1 - cx2, cy1 - cy2) < PILE_PROXIMITY
+
+
 def processing_loop():
     global camera
     camera   = init_camera()
@@ -74,18 +88,27 @@ def processing_loop():
     counter  = HiLoCounter()
     ev_calc  = EVCalculator()
 
-    # Spatial two-pile tracking.
-    # The frame is split down the middle:
-    #   Left  half → player pile  (cards 1 and 3 in standard deal)
-    #   Right half → dealer pile  (face-down hole card, then face-up upcard)
+    # Self-calibrating two-pile tracker.
     #
-    # prev_*_rank tracks the last CONFIDENTLY classified card on each pile.
-    # When the classification changes → new card placed on that pile.
-    # When confidence drops below threshold → transition (hand placing card) or
-    #   face-down card → reset to None so the next confident card registers fresh.
-    prev_left_rank  = None
-    prev_right_rank = None
-    sms_sent        = False   # One SMS per completed hand
+    # The first bounding box ever seen becomes the PLAYER pile anchor.
+    # Any box appearing far from the player pile becomes the DEALER pile anchor.
+    # No left/right or top/bottom assumption — the system learns from wherever
+    # the user physically places the first card.
+    #
+    # prev_*_rank tracks the last confident classification at each pile.
+    # When the classification changes → new card was placed on top.
+    # When confidence drops → hand is placing a card (transition) → reset to None
+    #   so the next confident result registers as a new card.
+    #   This also handles same-rank cards (8 on 8), since covering and re-placing
+    #   creates a low-confidence frame that resets the tracker.
+    #
+    # Face-down dealer hole card: low confidence → dealer_prev_rank stays None
+    #   → face-up upcard later placed on top triggers as first confident dealer card.
+    player_pile_box  = None   # Anchor box for player pile (set on first detection)
+    dealer_pile_box  = None   # Anchor box for dealer pile (set when second location seen)
+    player_prev_rank = None   # Last confirmed rank at player pile
+    dealer_prev_rank = None   # Last confirmed rank at dealer pile
+    sms_sent         = False  # One SMS per completed hand
 
     while True:
       try:
@@ -93,66 +116,68 @@ def processing_loop():
         if game_state["reset_requested"]:
             deck_mgr.reset()
             counter.reset()
-            prev_left_rank  = None
-            prev_right_rank = None
-            sms_sent        = False
+            player_pile_box  = None
+            dealer_pile_box  = None
+            player_prev_rank = None
+            dealer_prev_rank = None
+            sms_sent         = False
             game_state["reset_requested"] = False
             print("\n[main] Hand reset.")
 
-        frame   = capture_frame(camera)
-        frame_w = frame.shape[1]
+        frame = capture_frame(camera)
 
         # Step 1: Detect bounding boxes
         bounding_boxes = detect_cards(frame, camera.baseline_frame)
-
-        # Step 2: Split boxes into left (player) and right (dealer) piles
-        left_boxes  = [b for b in bounding_boxes if (b[0] + b[2] // 2) < frame_w // 2]
-        right_boxes = [b for b in bounding_boxes if (b[0] + b[2] // 2) >= frame_w // 2]
-
-        print(f"[main] boxes L={len(left_boxes)} R={len(right_boxes)} | "
+        print(f"[main] {len(bounding_boxes)} box(es) | "
               f"hand={game_state['player_hand']} dealer={game_state['dealer_upcard']}",
               end='\r')
 
-        # Step 3: Classify the dominant (largest) box on each pile
-        def best_classify(boxes):
-            """Classify the largest bounding box; return (rank, confidence)."""
-            if not boxes:
-                return None, 0.0
-            box = max(boxes, key=lambda b: b[2] * b[3])
-            x, y, w, h = box
-            img = cv2.resize(frame[y:y + h, x:x + w], (64, 64))
-            rank, _, conf = classify_card(model, img)
-            return rank, conf
-
-        left_rank,  left_conf  = best_classify(left_boxes)
-        right_rank, right_conf = best_classify(right_boxes)
-
-        # Step 4: Detect new cards — a change in confident classification = new card
         new_player_card = None
         new_dealer_card = None
 
-        # Left pile: player cards
-        if left_conf >= CV_CONFIDENCE:
-            if left_rank != prev_left_rank:
-                new_player_card = left_rank
-            prev_left_rank = left_rank
-        else:
-            # Low confidence = transition (hand placing card) or empty pile.
-            # Reset so the next confident card is treated as new.
-            prev_left_rank = None
+        for box in bounding_boxes:
+            x, y, w, h = box
+            img = cv2.resize(frame[y:y + h, x:x + w], (64, 64))
+            rank, _, conf = classify_card(model, img)
 
-        # Right pile: dealer cards.
-        # Face-down hole card → low confidence → ignored here.
-        # Face-up upcard → high confidence → triggers as new dealer card.
-        if right_conf >= CV_CONFIDENCE:
-            if right_rank != prev_right_rank:
-                new_dealer_card = right_rank
-            prev_right_rank = right_rank
-        else:
-            prev_right_rank = None
+            # ── Assign box to a pile ──────────────────────────────────────────
+            if player_pile_box is None:
+                # First box ever → establishes player pile location
+                player_pile_box = box
+                print(f"\n[main] Player pile anchored at {box_center(box)}")
+                if conf >= CV_CONFIDENCE:
+                    new_player_card  = rank
+                    player_prev_rank = rank
 
-        # Step 5: Update deck, counter, and hands for any new cards
-        new_cards = []   # (rank, role) — used for MQTT / InfluxDB publishing
+            elif near_pile(box, player_pile_box):
+                # This box is at the player pile
+                player_pile_box = box   # Update anchor to latest position
+                if conf >= CV_CONFIDENCE:
+                    if rank != player_prev_rank:
+                        new_player_card  = rank
+                    player_prev_rank = rank
+                else:
+                    # Low confidence = hand placing card; reset so next confident fires
+                    player_prev_rank = None
+
+            else:
+                # Box is in a different area → dealer pile
+                if dealer_pile_box is None:
+                    dealer_pile_box = box
+                    print(f"\n[main] Dealer pile anchored at {box_center(box)}")
+
+                if near_pile(box, dealer_pile_box):
+                    dealer_pile_box = box   # Update anchor
+                    if conf >= CV_CONFIDENCE:
+                        if rank != dealer_prev_rank:
+                            new_dealer_card  = rank
+                        dealer_prev_rank = rank
+                    else:
+                        # Face-down card or transition → keep dealer_prev_rank=None
+                        dealer_prev_rank = None
+
+        # Step 2: Process new cards
+        new_cards = []
         if new_player_card:
             deck_mgr.remove_card(new_player_card)
             counter.update(new_player_card)
@@ -167,14 +192,13 @@ def processing_loop():
             new_cards.append((new_dealer_card, "dealer"))
             print(f"\n[main] Dealer upcard: {new_dealer_card}")
 
-        # Step 6: Compute counts
+        # Step 3: Compute counts
         running, true = counter.get_counts(deck_mgr.decks_remaining())
 
-        # Log new cards to SQLite with updated counts
         for rank, role in new_cards:
             logger.log_card(rank, role, running, true)
 
-        # Step 7: EV recommendation and game state update
+        # Step 4: EV recommendation and game state update
         best_action, ev_breakdown = ev_calc.recommend(
             game_state["player_hand"],
             game_state["dealer_upcard"],
@@ -183,7 +207,7 @@ def processing_loop():
         bet_rec = kelly_bet(true, BANKROLL, BASE_BET)
 
         game_state.update({
-            "detected_cards":     [left_rank, right_rank],
+            "detected_cards":     [box_center(b) for b in bounding_boxes],
             "running_count":      running,
             "true_count":         true,
             "deck_state":         deck_mgr.deck_state.copy(),
@@ -192,7 +216,7 @@ def processing_loop():
             "bet_recommendation": bet_rec,
         })
 
-        # Step 8: Publish to MQTT (Node 2 — HiveMQ Cloud)
+        # Step 5: Publish to MQTT
         if new_cards:
             for rank, role in new_cards:
                 mqtt.publish_card(rank, role)
@@ -201,12 +225,11 @@ def processing_loop():
         if best_action:
             mqtt.publish_recommendation(best_action, ev_breakdown)
 
-        # Step 9: Log to InfluxDB Cloud
+        # Step 6: Log to InfluxDB
         if new_cards:
             logger.log_to_influx(running, true, bet_rec, best_action)
 
-        # Step 10: Send SMS once when the initial hand is complete
-        # (2 player cards + dealer upcard all set)
+        # Step 7: SMS once when hand is complete (2 player cards + dealer upcard)
         hand_complete = (
             len(game_state["player_hand"]) >= 2 and
             game_state["dealer_upcard"] is not None
