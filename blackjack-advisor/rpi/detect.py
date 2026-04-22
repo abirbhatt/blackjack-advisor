@@ -17,9 +17,10 @@ import cv2
 import numpy as np
 
 # A standard playing card is 63mm x 88mm → aspect ratio ≈ 0.716
-CARD_ASPECT_RATIO_MIN = 0.60
-CARD_ASPECT_RATIO_MAX = 0.80
-CARD_MIN_AREA         = 5000   # Minimum pixel area to ignore small noise
+# Range is intentionally wide to tolerate perspective distortion and camera angle
+CARD_ASPECT_RATIO_MIN = 0.45
+CARD_ASPECT_RATIO_MAX = 0.95
+CARD_MIN_AREA         = 3000   # Minimum pixel area to ignore small noise
 
 
 def detect_cards(frame, baseline_frame):
@@ -45,7 +46,7 @@ def detect_cards(frame, baseline_frame):
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
     # Step 4: Threshold — convert to binary (black/white)
-    _, thresh = cv2.threshold(blurred, 30, 255, cv2.THRESH_BINARY)
+    _, thresh = cv2.threshold(blurred, 20, 255, cv2.THRESH_BINARY)
 
     # Step 5: Find contours — trace outlines of white regions
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
