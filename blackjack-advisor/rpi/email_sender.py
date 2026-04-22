@@ -18,7 +18,7 @@ import requests
 
 # Put your Resend API key in an environment variable:
 #   export RESEND_API_KEY="re_..."
-RESEND_API_KEY = os.getenv("re_7Dex9iar_HPtH7MbdkVE9RDP6SxQJqQ6o", "")
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 RESEND_URL = "https://api.resend.com/emails"
 
 # Replace this with your verified sender in Resend.
