@@ -12,9 +12,10 @@ import threading
 import time
 import signal
 import sys
+import cv2
 
 from capture import init_camera, capture_frame, close_camera
-from detect import detect_cards, crop_corner
+from detect import detect_cards
 from classify import load_model, classify_card
 from deck_manager import DeckManager
 from counter import HiLoCounter
@@ -81,11 +82,12 @@ def processing_loop():
         bounding_boxes = detect_cards(frame, camera.baseline_frame)
 
         # Step 2: Classify each detected card with the CNN
-        # crop_corner extracts the rank/suit corner before passing to classifier
+        # Crop the full card region and resize to 64x64 — same as training data
         current_cards = set()
         for box in bounding_boxes:
-            corner = crop_corner(frame, box)
-            rank, suit, confidence = classify_card(model, corner)
+            x, y, w, h = box
+            card_img = cv2.resize(frame[y:y + h, x:x + w], (64, 64))
+            rank, suit, confidence = classify_card(model, card_img)
             if confidence >= CV_CONFIDENCE:
                 current_cards.add((rank, suit))
 

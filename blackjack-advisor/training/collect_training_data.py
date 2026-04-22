@@ -85,20 +85,37 @@ def print_summary():
     print()
 
 
-def crop_corner(frame_bgr, frame_w: int, frame_h: int):
+def find_card_in_frame(frame_bgr, baseline_bgr):
     """
-    Crop the top-left corner of the full frame — mirrors the crop_corner()
-    function in detect.py so training data matches inference input exactly.
-    Returns a 64×64 BGR image.
+    Use background subtraction to locate the card in the frame.
+    Returns a 64×64 BGR crop of the card region, or None if no card found.
+
+    This mirrors the detect.py pipeline so training images look exactly
+    like what the classifier will see at inference time (whole card, not
+    a corner sliver of the raw camera frame).
     """
     import cv2
-    corner_w = int(frame_w * 0.25)
-    corner_h = int(frame_h * 0.30)
-    corner   = frame_bgr[0:corner_h, 0:corner_w]
-    return cv2.resize(corner, (64, 64))
+
+    diff     = cv2.absdiff(frame_bgr, baseline_bgr)
+    gray     = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+    blurred  = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, thresh = cv2.threshold(blurred, 25, 255, cv2.THRESH_BINARY)
+
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    # Largest contour is the card
+    largest = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(largest) < 3000:
+        return None   # Too small — probably noise
+
+    x, y, w, h = cv2.boundingRect(largest)
+    card_crop  = frame_bgr[y:y + h, x:x + w]
+    return cv2.resize(card_crop, (64, 64))
 
 
-def capture_one_card(cam, rank: str, suit: str) -> bool:
+def capture_one_card(cam, baseline_bgr, rank: str, suit: str) -> bool:
     """
     Interactively capture SHOTS_PER_CARD images for a single card.
     Returns True on success, False if the user quits.
@@ -117,7 +134,7 @@ def capture_one_card(cam, rank: str, suit: str) -> bool:
 
     print(f"\n  ┌─ {rank} of {suit} {'─'*(35 - len(rank) - len(suit))}")
     print(f"  │  Rank folder has {existing}/{PHOTOS_PER_RANK} images. Taking {to_shoot} more.")
-    print(f"  │  Place the card corner (rank + suit) in the UPPER-LEFT of frame.")
+    print(f"  │  Place the card ANYWHERE in frame — the script finds it automatically.")
     print(f"  │  ENTER = capture  |  s = skip this card  |  q = quit")
     print(f"  └{'─'*40}")
 
@@ -137,23 +154,22 @@ def capture_one_card(cam, rank: str, suit: str) -> bool:
             print(f"  Skipped {rank} of {suit}.")
             return True
 
-        # Capture frame
-        raw = cam.capture_array()          # RGB from picamera2
-
-        # Convert RGB → BGR for OpenCV compatibility
+        # Capture frame and convert RGB → BGR
+        raw       = cam.capture_array()
         frame_bgr = cv2.cvtColor(raw, cv2.COLOR_RGB2BGR)
-        h, w      = frame_bgr.shape[:2]
 
-        # Crop corner (same logic as detect.py → classify.py pipeline)
-        corner = crop_corner(frame_bgr, w, h)
+        # Locate card using background subtraction (same pipeline as inference)
+        card_img = find_card_in_frame(frame_bgr, baseline_bgr)
+        if card_img is None:
+            print("  ⚠ No card detected — make sure the card is visible and the table is clear otherwise.")
+            continue
 
         # Save
         idx      = count_existing(rank) + 1
         filename = folder / f"{idx:05d}.jpg"
-        ok = cv2.imwrite(str(filename), corner)
+        ok = cv2.imwrite(str(filename), card_img)
         if not ok:
-            print(f"  ERROR: cv2.imwrite failed for {filename}")
-            print(f"  Image shape: {corner.shape}, dtype: {corner.dtype}")
+            print(f"  ERROR: cv2.imwrite failed — shape={card_img.shape} dtype={card_img.dtype}")
             continue
         captured += 1
         print(f"  Saved → {filename.name}  (rank '{rank}' total: {idx})")
@@ -199,14 +215,21 @@ def main():
         print("  Cancelled.")
         return
 
-    # Init camera
+    # Init camera — preview config keeps the sensor streaming so AE/AWB settle
     print("  Initializing Pi camera...")
+    import cv2
     cam    = Picamera2()
-    config = cam.create_still_configuration(main={"size": CAPTURE_RES, "format": "RGB888"})
+    config = cam.create_preview_configuration(main={"size": CAPTURE_RES, "format": "RGB888"})
     cam.configure(config)
     cam.start()
-    time.sleep(2)   # Allow sensor auto-exposure to settle
-    print("  Camera ready.\n")
+    time.sleep(3)   # Let AE/AWB converge before capturing baseline
+
+    # Capture baseline (empty table, no cards)
+    print("  ── Make sure the table is EMPTY, then press ENTER to capture baseline...")
+    input("  > ")
+    raw_baseline  = cam.capture_array()
+    baseline_bgr  = cv2.cvtColor(raw_baseline, cv2.COLOR_RGB2BGR)
+    print("  Baseline captured. Camera ready.\n")
 
     try:
         cards_done = 0
@@ -214,7 +237,7 @@ def main():
             for suit in SUITS:
                 if count_existing(rank) >= PHOTOS_PER_RANK:
                     break   # This rank is done — skip remaining suits
-                ok = capture_one_card(cam, rank, suit)
+                ok = capture_one_card(cam, baseline_bgr, rank, suit)
                 if not ok:
                     break
                 cards_done += 1
