@@ -12,8 +12,8 @@ import threading
 import time
 import signal
 import sys
-import math
 import cv2
+from collections import Counter
 
 from capture import init_camera, capture_frame, close_camera
 from detect import detect_cards
@@ -32,11 +32,13 @@ from flask_ui import create_app
 PLAYER_PHONE   = "+16502085215"   # TODO: replace with your phone number e.g. "+12135551234"
 BASE_BET       = 10               # Minimum bet in dollars
 BANKROLL       = 500              # Starting bankroll in dollars
-CV_CONFIDENCE  = 0.85             # Minimum CNN confidence to accept a classification
-CAPTURE_FPS    = 5                # Frames to process per second (higher = more responsive streaks)
-PILE_PROXIMITY = 200              # Pixels — how close a box must be to a known pile to belong to it
-STABLE_FRAMES  = 5                # Consecutive confident frames required to commit a card
-COOLDOWN_SECS  = 2.0              # Seconds a pile is locked after committing a card
+CV_CONFIDENCE  = 0.70             # Minimum CNN confidence to count a classification vote
+CAPTURE_FPS    = 5                # Frames to process per second
+STEP_STABLE    = 6                # Frames a new box count must hold before committing the card
+
+# Deal sequence: index 0-3 maps to the role of each card placed
+# 0 = player card 1, 1 = dealer hole (face-down, skipped), 2 = player card 2, 3 = dealer upcard
+DEAL_ROLES = ["player", "hole", "player", "dealer"]
 
 # ── Module-level camera reference so shutdown() can access it ────────────────
 camera = None
@@ -70,18 +72,6 @@ signal.signal(signal.SIGINT, shutdown)
 
 # ── Main Processing Loop ──────────────────────────────────────────────────────
 
-def box_center(box):
-    x, y, w, h = box
-    return x + w // 2, y + h // 2
-
-
-def near_pile(box, pile_box):
-    """True if box's center is within PILE_PROXIMITY pixels of pile_box's center."""
-    cx1, cy1 = box_center(box)
-    cx2, cy2 = box_center(pile_box)
-    return math.hypot(cx1 - cx2, cy1 - cy2) < PILE_PROXIMITY
-
-
 def processing_loop():
     global camera
     camera   = init_camera()
@@ -90,27 +80,24 @@ def processing_loop():
     counter  = HiLoCounter()
     ev_calc  = EVCalculator()
 
-    # Self-calibrating two-pile tracker with streak-based commit.
+    # ── Deal-sequence state ───────────────────────────────────────────────────
+    # Cards are dealt one at a time onto the table (not stacked).
+    # We watch the total box count each frame.  When it goes from N-1 to N and
+    # holds at N for STEP_STABLE frames, we commit the Nth card using a majority
+    # vote over the classifications seen during those stable frames.
     #
-    # A card is committed only after STABLE_FRAMES consecutive confident
-    # classifications of the same rank at the same pile.  After a commit the
-    # pile is locked for COOLDOWN_SECS so normal fluctuation can never spam
-    # the same card multiple times.
+    # DEAL_ROLES maps card index → role:
+    #   0 → player card 1
+    #   1 → dealer hole (face-down, classification skipped)
+    #   2 → player card 2
+    #   3 → dealer upcard
     #
-    # Face-down hole card: always low confidence → streak never builds → ignored.
-    # Same-rank card on top: cooldown expires, streak resets, then builds again.
-    player_pile_box    = None   # Anchor for player pile
-    dealer_pile_box    = None   # Anchor for dealer pile
-
-    player_candidate   = None   # Rank accumulating streak at player pile
-    player_streak      = 0      # Consecutive frames for that candidate
-    player_cooldown_ts = 0.0    # time.time() after which player pile can fire again
-
-    dealer_candidate   = None
-    dealer_streak      = 0
-    dealer_cooldown_ts = 0.0
-
-    sms_sent = False
+    # Boxes are sorted left→right (x-coord) each frame so the ordering is
+    # consistent regardless of which box OpenCV returns first.
+    deal_step   = 0    # which card we're waiting for next (0-3)
+    step_stable = 0    # consecutive frames we've seen (deal_step+1) boxes
+    step_votes  = []   # classification votes accumulated during stable period
+    sms_sent    = False
 
     while True:
       try:
@@ -118,90 +105,74 @@ def processing_loop():
         if game_state["reset_requested"]:
             deck_mgr.reset()
             counter.reset()
-            player_pile_box    = None
-            dealer_pile_box    = None
-            player_candidate   = None
-            player_streak      = 0
-            player_cooldown_ts = 0.0
-            dealer_candidate   = None
-            dealer_streak      = 0
-            dealer_cooldown_ts = 0.0
-            sms_sent           = False
+            deal_step   = 0
+            step_stable = 0
+            step_votes  = []
+            sms_sent    = False
             game_state["reset_requested"] = False
             print("\n[main] Hand reset.")
 
         frame = capture_frame(camera)
-        now   = time.time()
 
-        # Step 1: Detect bounding boxes
-        bounding_boxes = detect_cards(frame, camera.baseline_frame)
-        print(f"[main] {len(bounding_boxes)} box(es) | "
-              f"P:{player_candidate}x{player_streak}/{STABLE_FRAMES}  "
-              f"D:{dealer_candidate}x{dealer_streak}/{STABLE_FRAMES} | "
+        # Step 1: Detect bounding boxes, sort left→right for consistent ordering
+        bounding_boxes = sorted(
+            detect_cards(frame, camera.baseline_frame),
+            key=lambda b: b[0]   # sort by x coordinate
+        )
+        n = len(bounding_boxes)
+
+        print(f"[main] boxes={n}  deal_step={deal_step}  "
+              f"stable={step_stable}/{STEP_STABLE}  votes={step_votes} | "
               f"hand={game_state['player_hand']} dealer={game_state['dealer_upcard']}",
               end='\r')
 
         new_player_card = None
         new_dealer_card = None
 
-        for box in bounding_boxes:
-            x, y, w, h = box
-            img = cv2.resize(frame[y:y + h, x:x + w], (64, 64))
-            rank, _, conf = classify_card(model, img)
+        # ── Deal-sequence state machine ───────────────────────────────────────
+        if deal_step < 4:
+            expected = deal_step + 1   # how many boxes we need to see
 
-            # ── Assign box to a pile ──────────────────────────────────────────
-            if player_pile_box is None:
-                player_pile_box = box
-                print(f"\n[main] Player pile anchored at {box_center(box)}")
-                is_player = True
-            elif near_pile(box, player_pile_box):
-                player_pile_box = box
-                is_player = True
-            else:
-                if dealer_pile_box is None:
-                    dealer_pile_box = box
-                    print(f"\n[main] Dealer pile anchored at {box_center(box)}")
-                if near_pile(box, dealer_pile_box):
-                    dealer_pile_box = box
-                    is_player = False
-                else:
-                    continue  # Third location — ignore
+            if n == expected:
+                # Box count matches — accumulate
+                step_stable += 1
 
-            # ── Streak-based commit ───────────────────────────────────────────
-            if is_player:
-                if now < player_cooldown_ts:
-                    continue  # Pile locked after last commit
-                if conf >= CV_CONFIDENCE:
-                    if rank == player_candidate:
-                        player_streak += 1
-                        if player_streak >= STABLE_FRAMES:
-                            new_player_card    = rank
-                            player_cooldown_ts = now + COOLDOWN_SECS
-                            player_candidate   = None
-                            player_streak      = 0
+                role = DEAL_ROLES[deal_step]
+
+                if role != "hole":
+                    # Classify the card at this slot
+                    box = bounding_boxes[deal_step]
+                    x, y, w, h = box
+                    img = cv2.resize(frame[y:y + h, x:x + w], (64, 64))
+                    rank, _, conf = classify_card(model, img)
+                    if conf >= CV_CONFIDENCE:
+                        step_votes.append(rank)
+
+                if step_stable >= STEP_STABLE:
+                    # Commit this card
+                    if role == "hole":
+                        print(f"\n[main] Card {deal_step + 1}: dealer hole (face-down, skipped)")
+                    elif step_votes:
+                        committed = Counter(step_votes).most_common(1)[0][0]
+                        if role == "player":
+                            new_player_card = committed
+                        else:
+                            new_dealer_card = committed
+                        print(f"\n[main] Card {deal_step + 1} ({role}): {committed}  "
+                              f"(votes={step_votes})")
                     else:
-                        player_candidate = rank
-                        player_streak    = 1
-                else:
-                    player_candidate = None
-                    player_streak    = 0
-            else:
-                if now < dealer_cooldown_ts:
-                    continue  # Pile locked after last commit
-                if conf >= CV_CONFIDENCE:
-                    if rank == dealer_candidate:
-                        dealer_streak += 1
-                        if dealer_streak >= STABLE_FRAMES:
-                            new_dealer_card    = rank
-                            dealer_cooldown_ts = now + COOLDOWN_SECS
-                            dealer_candidate   = None
-                            dealer_streak      = 0
-                    else:
-                        dealer_candidate = rank
-                        dealer_streak    = 1
-                else:
-                    dealer_candidate = None
-                    dealer_streak    = 0
+                        print(f"\n[main] Card {deal_step + 1} ({role}): "
+                              f"no confident vote — confidence too low, skipping slot")
+
+                    deal_step  += 1
+                    step_stable = 0
+                    step_votes  = []
+
+            elif n < expected:
+                # A box disappeared (card removed mid-deal, or detection glitch) → reset streak
+                step_stable = 0
+                step_votes  = []
+            # n > expected: extra box visible during card placement — just wait
 
         # Step 2: Process new cards
         new_cards = []
@@ -234,7 +205,7 @@ def processing_loop():
         bet_rec = kelly_bet(true, BANKROLL, BASE_BET)
 
         game_state.update({
-            "detected_cards":     [box_center(b) for b in bounding_boxes],
+            "detected_cards":     [[b[0]+b[2]//2, b[1]+b[3]//2] for b in bounding_boxes],
             "running_count":      running,
             "true_count":         true,
             "deck_state":         deck_mgr.deck_state.copy(),
