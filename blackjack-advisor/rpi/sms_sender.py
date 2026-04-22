@@ -19,7 +19,7 @@ from requests.auth import HTTPBasicAuth
 # ── Fill these in with your Twilio credentials ────────────────────────────────
 ACCOUNT_SID  = "AC17cb81493da70904f6c335a6ff680c3d"    # From Twilio Console → Account Info
 AUTH_TOKEN   = "7069647852c8d3333cec4ac9f37ee220"                  # From Twilio Console → Account Info (click eye icon)
-TWILIO_FROM  = "+18335708265"                          # Your Twilio phone number
+TWILIO_FROM  = "+18146629675"                          # Your Twilio phone number
 # ─────────────────────────────────────────────────────────────────────────────
 
 TWILIO_URL = f"https://api.twilio.com/2010-04-01/Accounts/{ACCOUNT_SID}/Messages.json"
