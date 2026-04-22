@@ -13,6 +13,7 @@ import time
 import signal
 import sys
 import cv2
+import math
 from collections import Counter
 
 from capture import init_camera, capture_frame, close_camera
@@ -34,6 +35,7 @@ BASE_BET       = 10               # Minimum bet in dollars
 BANKROLL       = 500              # Starting bankroll in dollars
 CAPTURE_FPS    = 5                # Frames to process per second
 STEP_STABLE    = 6                # Frames a new box count must hold before committing the card
+BOX_PROXIMITY  = 150              # Pixels — two boxes this close share the same card slot
 
 # Deal sequence (3 visible cards — hole card is dealt off-camera):
 # 0 = player card 1, 1 = player card 2, 2 = dealer upcard
@@ -71,6 +73,17 @@ signal.signal(signal.SIGINT, shutdown)
 
 # ── Main Processing Loop ──────────────────────────────────────────────────────
 
+def find_new_box(bounding_boxes, committed_centers):
+    """Return the box whose center is far from all previously committed card positions."""
+    for box in bounding_boxes:
+        cx = box[0] + box[2] // 2
+        cy = box[1] + box[3] // 2
+        if not any(math.hypot(cx - px, cy - py) < BOX_PROXIMITY
+                   for px, py in committed_centers):
+            return box
+    return None
+
+
 def processing_loop():
     global camera
     camera   = init_camera()
@@ -93,10 +106,12 @@ def processing_loop():
     #
     # Boxes are sorted left→right (x-coord) each frame so the ordering is
     # consistent regardless of which box OpenCV returns first.
-    deal_step   = 0    # which card we're waiting for next (0–len(DEAL_ROLES)-1)
-    step_stable = 0    # consecutive frames we've seen (deal_step+1) boxes
-    step_votes  = []   # classification votes accumulated during stable period
-    sms_sent    = False
+    deal_step         = 0    # which card we're waiting for next (0–len(DEAL_ROLES)-1)
+    step_stable       = 0    # consecutive frames we've seen (deal_step+1) boxes
+    step_votes        = []   # classification votes accumulated during stable period
+    committed_centers = []   # (cx, cy) of each card committed so far
+    current_new_box   = None # the new box identified this stable run
+    sms_sent          = False
 
     while True:
       try:
@@ -104,10 +119,12 @@ def processing_loop():
         if game_state["reset_requested"]:
             deck_mgr.reset()
             counter.reset()
-            deal_step   = 0
-            step_stable = 0
-            step_votes  = []
-            sms_sent    = False
+            deal_step         = 0
+            step_stable       = 0
+            step_votes        = []
+            committed_centers = []
+            current_new_box   = None
+            sms_sent          = False
             game_state["reset_requested"] = False
             print("\n[main] Hand reset.")
 
@@ -133,32 +150,39 @@ def processing_loop():
             expected = deal_step + 1   # how many boxes we need to see
 
             if n == expected:
-                # Box count matches — accumulate a classification vote for this slot
-                step_stable += 1
-                box = bounding_boxes[deal_step]
-                x, y, w, h = box
-                img = cv2.resize(frame[y:y + h, x:x + w], (64, 64))
-                rank, _, conf = classify_card(model, img)
-                step_votes.append(rank)   # always vote — majority wins
+                # Find the box that is new (not near any previously committed card)
+                new_box = find_new_box(bounding_boxes, committed_centers)
+                if new_box is not None:
+                    step_stable += 1
+                    current_new_box = new_box
+                    x, y, w, h = new_box
+                    img = cv2.resize(frame[y:y + h, x:x + w], (64, 64))
+                    rank, _, conf = classify_card(model, img)
+                    step_votes.append(rank)   # always vote — majority wins
 
-                if step_stable >= STEP_STABLE:
-                    # Commit using majority vote
-                    committed = Counter(step_votes).most_common(1)[0][0]
-                    role = DEAL_ROLES[deal_step]
-                    if role == "player":
-                        new_player_card = committed
-                    else:
-                        new_dealer_card = committed
-                    print(f"\n[main] Card {deal_step + 1} ({role}): {committed}  "
-                          f"(votes={step_votes})")
-                    deal_step  += 1
-                    step_stable = 0
-                    step_votes  = []
+                    if step_stable >= STEP_STABLE:
+                        # Commit using majority vote
+                        committed = Counter(step_votes).most_common(1)[0][0]
+                        role = DEAL_ROLES[deal_step]
+                        if role == "player":
+                            new_player_card = committed
+                        else:
+                            new_dealer_card = committed
+                        cx = current_new_box[0] + current_new_box[2] // 2
+                        cy = current_new_box[1] + current_new_box[3] // 2
+                        committed_centers.append((cx, cy))
+                        print(f"\n[main] Card {deal_step + 1} ({role}): {committed}  "
+                              f"(votes={step_votes})")
+                        deal_step       += 1
+                        step_stable      = 0
+                        step_votes       = []
+                        current_new_box  = None
 
             elif n < expected:
-                # Box disappeared — reset streak
-                step_stable = 0
-                step_votes  = []
+                # Box disappeared — reset streak (but keep committed_centers)
+                step_stable     = 0
+                step_votes      = []
+                current_new_box = None
             # n > expected: card being placed, wait for count to stabilise
 
         # Step 2: Process new cards
