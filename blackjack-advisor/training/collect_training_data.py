@@ -150,7 +150,11 @@ def capture_one_card(cam, rank: str, suit: str) -> bool:
         # Save
         idx      = count_existing(rank) + 1
         filename = folder / f"{idx:05d}.jpg"
-        cv2.imwrite(str(filename), corner)
+        ok = cv2.imwrite(str(filename), corner)
+        if not ok:
+            print(f"  ERROR: cv2.imwrite failed for {filename}")
+            print(f"  Image shape: {corner.shape}, dtype: {corner.dtype}")
+            continue
         captured += 1
         print(f"  Saved → {filename.name}  (rank '{rank}' total: {idx})")
 
@@ -198,7 +202,7 @@ def main():
     # Init camera
     print("  Initializing Pi camera...")
     cam    = Picamera2()
-    config = cam.create_still_configuration(main={"size": CAPTURE_RES})
+    config = cam.create_still_configuration(main={"size": CAPTURE_RES, "format": "RGB888"})
     cam.configure(config)
     cam.start()
     time.sleep(2)   # Allow sensor auto-exposure to settle
