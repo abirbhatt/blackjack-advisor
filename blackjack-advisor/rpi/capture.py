@@ -15,13 +15,16 @@ def init_camera():
     Captures a baseline (empty table) frame for background subtraction.
     """
     cam = Picamera2()
-    config = cam.create_still_configuration(main={"size": (1920, 1080)})
+    # Preview config: continuous streaming so AE/AWB stay locked.
+    # Still config re-exposes each frame — baseline would never match live frames.
+    # BGR888 gives OpenCV-native format directly, no conversion needed.
+    config = cam.create_preview_configuration(main={"size": (1920, 1080), "format": "BGR888"})
     cam.configure(config)
     cam.start()
 
-    # Allow the sensor to settle before capturing
+    # Allow AE/AWB to fully converge before capturing baseline
     import time
-    time.sleep(2)
+    time.sleep(3)
 
     # Capture and store the baseline empty-table frame for background subtraction
     cam.baseline_frame = cam.capture_array()

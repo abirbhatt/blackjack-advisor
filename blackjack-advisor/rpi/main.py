@@ -75,11 +75,13 @@ def processing_loop():
     previous_cards = set()
 
     while True:
+      try:
         frame = capture_frame(camera)
 
         # Step 1: Detect card bounding boxes with OpenCV
         # Pass the baseline (empty table) frame for background subtraction
         bounding_boxes = detect_cards(frame, camera.baseline_frame)
+        print(f"[main] Detected {len(bounding_boxes)} box(es) | cards={current_cards if 'current_cards' in dir() else 'n/a'}", end='\r')
 
         # Step 2: Classify each detected card with the CNN
         # Crop the full card region and resize to 64x64 — same as training data
@@ -141,6 +143,12 @@ def processing_loop():
         # TODO: Trigger SMS when player_hand is set and it's their turn
 
         time.sleep(1 / CAPTURE_FPS)
+
+      except Exception as e:
+        import traceback
+        print(f"\n[main] Processing error: {e}")
+        traceback.print_exc()
+        time.sleep(1)
 
 
 if __name__ == "__main__":
