@@ -108,6 +108,17 @@ def processing_loop():
         for rank, suit in new_cards:
             logger.log_card(rank, suit, running, true)
 
+        # Assign new cards to dealer/player hands for EV calculation.
+        # Simple rule: first card placed on table = dealer upcard,
+        # all subsequent cards = player hand (up to 5 cards).
+        for rank, suit in new_cards:
+            if game_state["dealer_upcard"] is None:
+                game_state["dealer_upcard"] = rank
+                print(f"\n[main] Dealer upcard set: {rank}")
+            elif len(game_state["player_hand"]) < 5:
+                game_state["player_hand"].append(rank)
+                print(f"\n[main] Player hand: {game_state['player_hand']}")
+
         # Step 5: Update game state
         best_action, ev_breakdown = ev_calc.recommend(
             game_state["player_hand"],
